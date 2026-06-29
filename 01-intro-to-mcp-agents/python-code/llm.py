@@ -57,63 +57,66 @@ class LLMProvider(ABC):
 # === Providers ===
 
 class AnthropicProvider(LLMProvider):
-    """Anthropic Claude provider."""
+    """OpenRouter provider (Anthropic-compatible)."""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+    def __init__(self, api_key: str, model: str = "anthropic/claude-3-haiku"):
         self.api_key = api_key
         self.model = model
 
     async def chat(self, messages: list[Message], tools: list[Tool] | None = None) -> LLMResponse:
+        all_messages = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
         system_message = next((m for m in messages if m.role == "system"), None)
-        other_messages = [m for m in messages if m.role != "system"]
 
         body: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 4096,
-            "messages": [{"role": m.role, "content": m.content} for m in other_messages],
+            "messages": all_messages,
         }
 
         if system_message:
-            body["system"] = system_message.content
+            body["messages"] = [{"role": "system", "content": system_message.content}] + all_messages
 
         if tools:
             body["tools"] = [
                 {
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.input_schema,
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
                 }
                 for t in tools
             ]
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://openrouter.ai/api/v1/chat/completions",
                 headers={
                     "Content-Type": "application/json",
-                    "x-api-key": self.api_key,
-                    "anthropic-version": "2023-06-01",
+                    "Authorization": f"Bearer {self.api_key}",
                 },
                 json=body,
                 timeout=60.0,
             )
 
-            if response.status_code != 200:
-                raise Exception(f"Anthropic API error: {response.status_code} - {response.text}")
+        if response.status_code != 200:
+            raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
 
-            data = response.json()
+        data = response.json()
 
         content: str | None = None
         tool_calls: list[ToolCall] = []
 
-        for block in data["content"]:
-            if block["type"] == "text":
-                content = block["text"]
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    name=block["name"],
-                    arguments=block["input"],
-                ))
+        message = data["choices"][0]["message"]
+        content = message.get("content")
+
+        for tc in message.get("tool_calls", []) or []:
+            import json
+            tool_calls.append(ToolCall(
+                name=tc["function"]["name"],
+                arguments=json.loads(tc["function"]["arguments"]),
+            ))
 
         return LLMResponse(content=content, tool_calls=tool_calls)
 
@@ -217,23 +220,18 @@ class GeminiProvider(LLMProvider):
             }]
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                json=body,
-                timeout=60.0,
-            )
+            response = await client.post(url, json=body, timeout=60.0)
 
-            if response.status_code != 200:
-                raise Exception(f"Gemini API error: {response.status_code} - {response.text}")
+        if response.status_code != 200:
+            raise Exception(f"Gemini API error: {response.status_code} - {response.text}")
 
-            data = response.json()
-
-        candidate = data["candidates"][0]
-        parts = candidate["content"]["parts"]
+        data = response.json()
 
         content: str | None = None
         tool_calls: list[ToolCall] = []
+
+        candidate = data.get("candidates", [{}])[0]
+        parts = candidate.get("content", {}).get("parts", [])
 
         for part in parts:
             if "text" in part:
@@ -241,7 +239,7 @@ class GeminiProvider(LLMProvider):
             elif "functionCall" in part:
                 tool_calls.append(ToolCall(
                     name=part["functionCall"]["name"],
-                    arguments=part["functionCall"].get("args", {}),
+                    arguments=part["functionCall"]["args"],
                 ))
 
         return LLMResponse(content=content, tool_calls=tool_calls)
